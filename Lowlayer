@@ -1,0 +1,109 @@
+# !pip install --upgrade "transformers>=4.43" "accelerate>=0.33" torch --extra-index-url https://download.pytorch.org/whl/cu121
+import os, re, contextlib, torch
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from accelerate.hooks import cpu_offload
+
+MODEL_ID = "Qwen/Qwen3-Coder-30B-A3B-Instruct"  # or the non-instruct if you prefer
+DEVICE = "cuda"
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16  # full precision (no int8/4)
+
+# ---- 1) Cap GPU memory so Accelerate *must* offload aggressively ----
+max_memory = {
+    0: "10GiB",      # keep router/shared + a handful of experts and activations
+    "cpu": "200GiB"  # adjust to your system RAM; offload folder covers spillover
+}
+
+offload_folder = "./offload_qwen_moe"
+os.makedirs(offload_folder, exist_ok=True)
+
+# ---- 2) Build an "experts-to-CPU, router/shared-to-GPU" device_map ----
+# We'll start with "severely constrained" auto map, then move router/shared to cuda.
+# This avoids guessing exact internal names and still forces most params to CPU.
+base_device_map = "auto"
+
+print("Loading config/tokenizer ...")
+config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+print("Initializing empty model graph ...")
+with init_empty_weights():
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=DTYPE, trust_remote_code=True)
+
+print("Dispatching checkpoint with strict GPU cap ...")
+model = load_checkpoint_and_dispatch(
+    model,
+    MODEL_ID,
+    device_map=base_device_map,
+    max_memory=max_memory,
+    offload_folder=offload_folder,
+    offload_state_dict=True,
+    dtype=DTYPE
+)
+
+# ---- 3) Identify expert modules and attach per-expert CPU offload hooks ----
+# Heuristic: any submodule whose name path includes ".experts." (common in MoE impls)
+# If Qwen uses different naming, adjust the regex below.
+expert_name_re = re.compile(r"\.experts(\.|$)")
+expert_modules = []
+
+for name, module in model.named_modules():
+    if expert_name_re.search(name):
+        # Only leaf modules need hooks: skip containers that also have children experts.
+        if not any(child is not module and child in module.children() for child in module.children()):
+            expert_modules.append((name, module))
+
+# Fallback: if none were found, try grabbing children named exactly "experts"
+if not expert_modules:
+    for name, module in model.named_modules():
+        if name.endswith(".experts"):
+            for idx, child in enumerate(module.children()):
+                expert_modules.append((f"{name}.{idx}", child))
+
+print(f"Found ~{len(expert_modules)} expert submodules to offload.")
+
+# Attach per-expert CPU offload hooks so they come to CUDA just-in-time for forward.
+for name, module in expert_modules:
+    cpu_offload(module, execution_device=DEVICE, offload_buffers=True)
+
+# Optionally, *ensure* non-expert / router stays on GPU to reduce transfer overhead:
+# Move top-level model blocks that are not experts to CUDA (safe: small compared to full experts)
+def try_to_cuda_router_layers(m):
+    try:
+        m.to(DEVICE)
+    except Exception:
+        pass
+
+# Example: push embedding, final lm head, and router/gates to CUDA if not already
+for name, module in model.named_modules():
+    # crude heuristic: don't pull experts back; push small/shared stuff to CUDA
+    if "experts" not in name.lower():
+        # Avoid moving enormous blocks (Accelerate will error if offloaded shard)
+        with contextlib.suppress(Exception):
+            for p in module.parameters(recurse=False):
+                pass
+            try_to_cuda_router_layers(module)
+
+torch.cuda.empty_cache()
+
+def vram_gb():
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / (1024**3), torch.cuda.memory_allocated()/(1024**3), torch.cuda.memory_reserved()/(1024**3)
+
+print("Warmup prompt …")
+prompt = "Write a Python function `merge_k_lists` that merges k sorted linked lists."
+inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+
+print("VRAM before generate (GB):", vram_gb())
+
+gen_ids = model.generate(
+    **inputs,
+    max_new_tokens=96,
+    do_sample=False,
+    use_cache=True,   # keep KV cache; for measuring pure weights, set False once to compare
+)
+
+print("VRAM after generate (GB):", vram_gb())
+
+print("\n=== OUTPUT ===\n")
+print(tokenizer.decode(gen_ids[0], skip_special_tokens=True))
