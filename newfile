@@ -1,0 +1,183 @@
+
+pip install streamlit supervision roboflow opencv-python-headless pillow numpy
+
+import io
+import json
+from typing import List, Dict, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+import streamlit as st
+
+# supervision import: try common exposures
+try:
+    import supervision as sv
+    mask_to_polygons = sv.utils.mask_to_polygons
+except Exception:
+    # fallback import if package layout differs
+    from supervision.detection.utils import mask_to_polygons  # type: ignore
+
+st.set_page_config(layout="wide", page_title="Mask → Polygons (Streamlit)")
+
+st.title("Mask → Polygons (WebP masks)")
+st.markdown(
+    """
+Upload a mask image (WEBP or other). Each distinct color is treated as a different instance/class color.
+This app extracts polygons for each colored region and overlays them on the image.
+"""
+)
+
+# Sidebar controls
+st.sidebar.header("Options")
+min_area = st.sidebar.slider("Minimum polygon area (px)", min_value=10, max_value=5000, value=100, step=10)
+simplify_enabled = st.sidebar.checkbox("Simplify polygons (approxPolyDP)", value=True)
+simplify_epsilon = st.sidebar.slider("Simplify epsilon (0.0 - 2.0% of perimeter)", 0.0, 2.0, 0.5, step=0.1)
+show_labels = st.sidebar.checkbox("Show labels on image", value=True)
+background_as_most_common = st.sidebar.checkbox("Treat most common color as background", value=True)
+
+uploaded = st.file_uploader("Upload mask file (webp, png, jpg...) — mask should use distinct colors per object", type=["webp","png","jpg","jpeg","bmp"])
+
+def pil_to_rgb_np(img_pil: Image.Image) -> np.ndarray:
+    return np.array(img_pil.convert("RGB"))
+
+def unique_colors(img_np: np.ndarray) -> np.ndarray:
+    # reshape (H*W, 3) and get unique rows
+    pixels = img_np.reshape(-1, 3)
+    colours = np.unique(pixels, axis=0)
+    return colours
+
+def color_mask_to_polygons(mask_bgr: np.ndarray, color: Tuple[int,int,int], min_area_px: int) -> List[np.ndarray]:
+    # mask_bgr in BGR
+    lower = np.array(color, dtype=np.uint8)
+    upper = np.array(color, dtype=np.uint8)
+    mask = cv2.inRange(mask_bgr, lower, upper)  # single-color mask
+    # convert to boolean ndarray expected by supervision (H,W)
+    bool_mask = mask > 0
+    # get polygons list from supervision
+    polys = mask_to_polygons(bool_mask)
+    # polys are numpy arrays shaped (N,2) in XY order (x,y)
+    filtered = []
+    for p in polys:
+        if p is None or len(p) < 3:
+            continue
+        area = abs(cv2.contourArea(p.astype(np.float32)))
+        if area < min_area_px:
+            continue
+        filtered.append(p)
+    return filtered
+
+def approx_polygon(poly: np.ndarray, epsilon_ratio: float) -> np.ndarray:
+    # poly shape (N,2) as float or int
+    peri = cv2.arcLength(poly.astype(np.float32), True)
+    eps = peri * epsilon_ratio
+    approx = cv2.approxPolyDP(poly.astype(np.float32), epsilon=eps, closed=True)
+    # approx returns Nx1x2; reshape to Nx2
+    approx = approx.reshape(-1,2)
+    return approx
+
+if uploaded is not None:
+    # Read file into PIL then numpy RGB
+    img_pil = Image.open(io.BytesIO(uploaded.read()))
+    rgb = pil_to_rgb_np(img_pil)
+    # convert to BGR for OpenCV
+    bgr = rgb[..., ::-1].copy()
+    h, w = bgr.shape[:2]
+
+    # find unique colors
+    colours = unique_colors(rgb)  # in RGB
+    # convert to list of tuples in BGR to match cv2.inRange usage
+    colours_bgr = [tuple((c[::-1]).tolist()) for c in colours]
+
+    # determine background color (most common) if enabled
+    bg_color_bgr = None
+    if background_as_most_common:
+        pixels = bgr.reshape(-1,3)
+        # find most frequent row
+        vals, counts = np.unique(pixels, axis=0, return_counts=True)
+        most_idx = int(np.argmax(counts))
+        bg = tuple(vals[most_idx].tolist())
+        bg_color_bgr = bg
+
+    # iterate colors and build polygons
+    all_polygons = []  # list of dicts {label,color,polygon,area,bbox}
+    for col_bgr in colours_bgr:
+        if bg_color_bgr is not None and tuple(col_bgr) == tuple(bg_color_bgr):
+            continue
+        # skip pure black if likely background
+        if tuple(col_bgr) == (0,0,0) and background_as_most_common:
+            continue
+        polys = color_mask_to_polygons(bgr, col_bgr, min_area)
+        for p in polys:
+            poly_pts = p.astype(np.int32)
+            if simplify_enabled:
+                eps_ratio = float(simplify_epsilon) / 100.0
+                poly_pts = approx_polygon(poly_pts, eps_ratio)
+            area = abs(cv2.contourArea(poly_pts.astype(np.float32)))
+            x,y,w_box,h_box = cv2.boundingRect(poly_pts.astype(np.int32))
+            obj = {
+                "label": f"color_{col_bgr[0]}_{col_bgr[1]}_{col_bgr[2]}",
+                "color_bgr": col_bgr,
+                "polygon": poly_pts.tolist(),  # list of [x,y]
+                "area": float(area),
+                "bbox": [int(x), int(y), int(w_box), int(h_box)]
+            }
+            all_polygons.append(obj)
+
+    st.sidebar.markdown(f"**Detected colors (excluding background):** {len(all_polygons)} polygons")
+
+    # draw overlay
+    overlay = bgr.copy()
+    for idx, obj in enumerate(all_polygons):
+        pts = np.array(obj["polygon"], dtype=np.int32).reshape(-1,1,2)
+        # random-ish color for drawing (not too dark): use the object color inverted slightly
+        col = tuple([int(min(255, c+80)) for c in obj["color_bgr"]])
+        cv2.polylines(overlay, [pts], isClosed=True, color=col, thickness=2, lineType=cv2.LINE_AA)
+        if show_labels:
+            # label at first point
+            x0, y0 = obj["polygon"][0]
+            cv2.putText(overlay, obj["label"], (int(x0), int(y0)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+
+    # convert overlay to RGB for streamlit
+    overlay_rgb = overlay[..., ::-1]
+    st.image(overlay_rgb, caption="Polygons overlay (RGB)", use_column_width=True)
+
+    # Show polygon table and allow download
+    st.subheader("Polygons")
+    if len(all_polygons) == 0:
+        st.warning("No polygons found. Try lowering min area or turn off 'treat most common color as background'.")
+    else:
+        # show a compact list
+        for i, obj in enumerate(all_polygons):
+            st.markdown(f"**#{i+1}** — {obj['label']} • area: {obj['area']:.1f} px • bbox: {obj['bbox']}")
+            if st.checkbox(f"Show points for #{i+1}", key=f"pts_{i}"):
+                st.write(obj["polygon"])
+
+        # prepare downloadable JSON in simple COCO-like format
+        export = {
+            "image": {
+                "width": int(w),
+                "height": int(h),
+                "filename": uploaded.name
+            },
+            "annotations": []
+        }
+        for i, obj in enumerate(all_polygons):
+            # segmentation as flattened list [x1,y1,x2,y2,...]
+            seg = [int(v) for point in obj["polygon"] for v in point]
+            ann = {
+                "id": i+1,
+                "label": obj["label"],
+                "segmentation": [seg],
+                "bbox": obj["bbox"],
+                "area": obj["area"]
+            }
+            export["annotations"].append(ann)
+
+        st.download_button("Download polygons JSON", data=json.dumps(export, indent=2), file_name="polygons.json", mime="application/json")
+
+    # show original mask too
+    with st.expander("Show original mask image"):
+        st.image(rgb, caption="Original mask (RGB)", use_column_width=True)
+else:
+    st.info("Upload a mask file to get started.")
